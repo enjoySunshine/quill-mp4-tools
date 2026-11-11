@@ -512,6 +512,21 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
       if (this.onMoovStart) this.onMoovStart();
     }
 
+    if (this.meta) {
+      if (this.flattenItemInfo && !this.itemListBuilt) {
+        this.flattenItemInfo();
+        this.itemListBuilt = true;
+      }
+      /* Process items before computing the next fetch position so that any
+         bytes consumed from the new buffer are reflected in the item extents'
+         alreadyRead counters and the returned position actually targets the
+         earliest missing item data (e.g. mdat data located before a trailing
+         meta box). */
+      if (this.processItems) {
+        this.processItems(this.onItem);
+      }
+    }
+
     if (this.moov) {
       /* A moov box has been entirely parsed */
 
@@ -541,6 +556,13 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
       } else {
         nextFileStart = this.nextParsePosition;
       }
+      /* Item data may be needed in regions the parser itself skipped (e.g. an
+         mdat box before the moov/meta box): make sure the earliest missing
+         item bytes are requested too. */
+      const nextItemPosition = this.getNextItemSeekPosition();
+      if (nextItemPosition !== undefined && nextItemPosition < nextFileStart) {
+        nextFileStart = nextItemPosition;
+      }
       if (this.stream.getEndFilePositionAfter) {
         nextFileStart = this.stream.getEndFilePositionAfter(nextFileStart);
       }
@@ -553,20 +575,23 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
         /* No valid buffer has been parsed yet, we cannot know what to parse next */
         nextFileStart = 0;
       }
+      /* For files without a moov box (e.g. HEIF/AVIF image files) or while the
+         moov box has not been found yet, item extents are the only indication
+         of which media bytes still need to be fetched. Without this, a trailing
+         meta box makes the parser jump to the end of the file and the item
+         data before it is never requested. */
+      const nextItemPosition = this.getNextItemSeekPosition();
+      if (nextItemPosition !== undefined && nextItemPosition < nextFileStart) {
+        nextFileStart = nextItemPosition;
+      }
+      if (this.stream.getEndFilePositionAfter) {
+        nextFileStart = this.stream.getEndFilePositionAfter(nextFileStart);
+      }
     }
     if (this.sidx) {
       if (this.onSidx && !this.sidxSent) {
         this.onSidx(this.sidx);
         this.sidxSent = true;
-      }
-    }
-    if (this.meta) {
-      if (this.flattenItemInfo && !this.itemListBuilt) {
-        this.flattenItemInfo();
-        this.itemListBuilt = true;
-      }
-      if (this.processItems) {
-        this.processItems(this.onItem);
       }
     }
 
@@ -1043,6 +1068,11 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
     Log.info('ISOFile', 'Flushing remaining samples');
     this.updateSampleLists();
     this.processSamples(true);
+    /* Deliver any image item whose data is only complete once the final
+       buffers have been appended. Items already delivered are not re-emitted. */
+    if (this.meta && this.processItems) {
+      this.processItems(this.onItem);
+    }
     this.stream.cleanBuffers();
     this.stream.logBufferLevel(true);
   }
@@ -2447,12 +2477,46 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
     }
   }
 
+  /**
+   * Returns the earliest file position still needed to complete the data of
+   * any not-yet-delivered item (the next unread byte of one of its extents),
+   * or undefined if all known items are complete. Used to guide range requests
+   * when item data (e.g. in an 'mdat' box) is located before the 'meta' box.
+   *
+   * @bundle isofile-item-processing.js
+   */
+  getNextItemSeekPosition() {
+    let nextPosition: number | undefined;
+    for (const i in this.items) {
+      const item = this.items[i];
+      if (item.sent || !item.extents || item.extents.length === 0) {
+        continue;
+      }
+      for (const extent of item.extents) {
+        if (extent.alreadyRead === undefined || extent.alreadyRead < extent.length) {
+          const extentPosition = extent.offset + (extent.alreadyRead ?? 0);
+          if (nextPosition === undefined || extentPosition < nextPosition) {
+            nextPosition = extentPosition;
+          }
+        }
+      }
+    }
+    return nextPosition;
+  }
+
   /** @bundle isofile-item-processing.js */
   processItems(callback: (item: Item) => void) {
     for (const i in this.items) {
       const item = this.items[i];
-      this.getItem(item.id);
-      if (callback && !item.sent) {
+      if (item.sent) continue;
+      /* Items without any data to fetch (derived items, or location records
+         with only zero-length extents such as item-offset construction) are
+         signaled immediately. Other items are only signaled once getItem
+         confirms all their extents are fully available in the current
+         buffers; incomplete items are retried when more buffers arrive, so
+         onItem is called exactly once and always with complete bytes. */
+      const complete = !item.size || this.getItem(item.id) !== undefined;
+      if (complete && callback) {
         callback(item);
         item.sent = true;
         item.data = undefined;
@@ -2613,7 +2677,16 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
           if (this.moovStartFound) {
             this.nextParsePosition = this.stream.getEndPosition();
           } else {
-            this.nextParsePosition = this.stream.getPosition() + ret.size;
+            /* The moov box has not been found yet. Historically the parser
+               would skip this box entirely, guiding the downloader to its end
+               to look for the moov box further in the file. With range
+               requests driven by the returned position, those skipped bytes
+               are never downloaded, which corrupts any data held by this box
+               (e.g. a 'meta' box at the start of an image file split across
+               small chunks). Request the next contiguous bytes instead: once
+               the box is fully buffered it gets parsed on the next pass,
+               while mdat boxes keep their dedicated end-of-box guidance. */
+            this.nextParsePosition = this.stream.findEndContiguousBuf();
           }
         }
         return false;
